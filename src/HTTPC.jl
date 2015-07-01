@@ -7,7 +7,8 @@ using LibCURL.Mime_ext
 import Base.convert, Base.show, Base.get, Base.trace
 
 export init, cleanup, get, put, post, trace, delete, head, options
-export RequestOptions, Response
+export connect, disconnect, getbytes, isDone
+export RequestOptions, Response, ConnContext, StreamData, StreamGroup
 
 def_rto = 0.0
 
@@ -24,21 +25,23 @@ type RequestOptions
     headers::Vector{Tuple}
     ostream::Union(IO, String, Nothing)
     auto_content_type::Bool
+    max_errs::Int64
+    timeout::Float64
+    ctimeout::Float64
 
-    RequestOptions(; blocking=true, query_params=Array(Tuple,0), request_timeout=def_rto, callback=null_cb, content_type="", headers=Array(Tuple,0), ostream=nothing, auto_content_type=true) =
-    new(blocking, query_params, request_timeout, callback, content_type, headers, ostream, auto_content_type)
+    RequestOptions(; blocking=true, query_params=Array(Tuple,0), request_timeout=def_rto, callback=null_cb, content_type="", headers=Array(Tuple,0), ostream=nothing, auto_content_type=true, max_errs=10, timeout=2, ctimeout=30) =
+        new(blocking, query_params, request_timeout, callback, content_type, headers, ostream, auto_content_type, max_errs, timeout, ctimeout)
 end
 
 type Response
     body
-    headers :: Dict{String, Vector{String}}
+    headers::Dict{String, Vector{String}}
     http_code
     total_time
     bytes_recd::Integer
 
     Response() = new(nothing, Dict{String, Vector{String}}(), 0, 0.0, 0)
 end
-
 function show(io::IO, o::Response)
     println(io, "HTTP Code   :", o.http_code)
     println(io, "RequestTime :", o.total_time)
@@ -48,10 +51,8 @@ function show(io::IO, o::Response)
             println(io, "    $k : $v")
         end
     end
-
     println(io, "Length of body : ", o.bytes_recd)
 end
-
 
 type ReadData
     typ::Symbol
@@ -63,6 +64,27 @@ type ReadData
     ReadData() = new(:undefined, false, "", 0, 0)
 end
 
+type StreamData
+    bytes_streamed::Int64
+    bytes_read::Int64
+    bytes_wanted::Int64
+    buff::IOBuffer
+    state::Symbol
+    numErrs::Int64
+    lastTime::Float64
+ 
+    const MAX_BUFF_SIZE = 16*1024 # 16KiB
+    StreamData() = new(0, 0, 0, IOBuffer(MAX_BUFF_SIZE), :NONE, 0, 0)
+end
+function show(io::IO, o::StreamData)
+    print(io, "streamed: ", o.bytes_streamed)
+    print(io, ", read: ", o.bytes_read)
+    print(io, ", wanted: ", o.bytes_wanted)
+    print(io, ", numErrs: ", o.numErrs)
+    println(io, ", lastTime: ", o.lastTime)
+    print(io, o.buff)
+end
+
 type ConnContext
     curl::Ptr{CURL}
     url::String
@@ -71,26 +93,52 @@ type ConnContext
     resp::Response
     options::RequestOptions
     close_ostream::Bool
+    stream::StreamData
 
-    ConnContext(options::RequestOptions) = new(C_NULL, "", C_NULL, ReadData(), Response(), options, false)
+    ConnContext(options::RequestOptions) = new(C_NULL, "", C_NULL, ReadData(), Response(), options, false, StreamData())
+end
+function show(io::IO, o::ConnContext)
+    print(io, "URL : ", o.url)
+    print(io, ", CURL : ", o.curl)
+    println(io, ", slist : ", o.slist)
+    println(io, "ReadData : ", o.rd)
+    println(io, "OStream  : ", o.close_ostream)
+    println("***   Response  ***")
+    print(io, o.resp)
+    println("***   Options   ***")
+    println(io, o.options)
+    println("*** Stream Data ***")
+    println(io, o.stream)
 end
 
-immutable CURLMsg2
+type StreamGroup
+    ctxts::Vector{ConnContext}
+    curlm::Ptr{CURL}
+    share::Ptr{CURL}
+
+    StreamGroup(contexts, curlm, share) = new(contexts, curlm, share)
+end
+function show(io::IO, o::StreamGroup)
+    println("#===============================#")
+    println("#          Stream Group         #")
+    println("#===============================#")
+    println(io, "multi handle : ", o.curlm)
+    println(io, "share handle : ", o.share)
+    i = 0
+    for ctxt in o.ctxts
+        i += 1
+        println("---------------------")
+        println(io, "|     Context $(i):    |")
+        println("---------------------")
+        print(io, ctxt)
+    end
+end
+
+immutable CURLMsgResult
   msg::CURLMSG
   easy_handle::Ptr{CURL}
-  data::Ptr{Any}
+  result::CURLcode
 end
-
-type MultiCtxt
-    s::curl_socket_t    # Socket
-    chk_read::Bool
-    chk_write::Bool
-    timeout::Float64
-
-    MultiCtxt() = new(0,false,false,0.0)
-end
-
-
 
 ##############################
 # Callbacks
@@ -341,27 +389,6 @@ function process_response(ctxt)
     ctxt.resp.total_time = total_time[1]
 end
 
-# function blocking_get (url)
-#     try
-#         ctxt=nothing
-#         ctxt = setup_easy_handle(url)
-#         curl = ctxt.curl
-#
-#         @ce_curl curl_easy_perform
-#
-#         process_response(ctxt)
-#
-#         return ctxt.resp
-#     finally
-#         if isa(ctxt, ConnContext) && (ctxt.curl != 0)
-#             curl_easy_cleanup(ctxt.curl)
-#         end
-#     end
-# end
-
-
-
-
 
 ##############################
 # Library initializations
@@ -560,6 +587,63 @@ function custom(url::String, verb::String, options::RequestOptions)
     end
 end
 
+##############################
+# STREAMING FUNCTIONS
+##############################
+
+function connect(url::String)
+    return connect([url])
+end
+
+function connect{T<:String}(urls::Vector{T}, options::RequestOptions=RequestOptions())
+    curlm = curl_multi_init()
+    if (curlm == C_NULL) error("Unable to initialize curl_multi_init()") end
+
+    share = curl_share_init()
+    if (share == C_NULL) error("Unable to initialize curl_share_init()") end
+
+    ctxts = ConnContext[]
+    for url in urls
+        ctxt = setup_easy_handle(url, options)
+        curl = ctxt.curl
+        @ce_curl  curl_easy_setopt CURLOPT_SHARE share
+        @ce_curlm curl_multi_add_handle curl
+        push!(ctxts, ctxt)
+    end
+
+    return StreamGroup(ctxts, curlm, share)
+end
+
+function disconnect(group::StreamGroup)
+    for ctxt in group.ctxts
+        curl_multi_remove_handle(group.curlm, ctxt.curl)
+        cleanup_easy_context(ctxt)
+    end
+    curl_multi_cleanup(group.curlm)
+    curl_share_cleanup(group.share)
+end
+
+function get(group::StreamGroup)
+    return nothing
+end
+
+function getbytes(group::StreamGroup, numBytes::Int64)
+    numCtxts = length(group.ctxts)
+    return getbytes(group, [numBytes for _=1:numCtxts])
+end
+
+function getbytes(group::StreamGroup, numBytes::Vector{Int64})
+    return nothing
+end
+
+function isDone(group::StreamGroup)
+    for ctxt in group.ctxts
+        if (ctxt.stream.state == :DONE)
+            return false
+        end
+    end
+    return true
+end
 
 ##############################
 # EXPORTED UTILS
@@ -640,48 +724,6 @@ function exec_as_multi(ctxt)
         started_at = time()
         time_left = request_timeout
 
-    # poll_fd is unreliable when multiple parallel fds are active, hence using curl_multi_perform
-
-# START curl_multi_socket_action  mode
-
-#         @ce_curlm curl_multi_setopt CURLMOPT_SOCKETFUNCTION c_curl_socket_cb
-#         @ce_curlm curl_multi_setopt CURLMOPT_TIMERFUNCTION c_curl_multi_timer_cb
-#
-#         muctxt = MultiCtxt()
-#         p_muctxt = pointer_from_objref(muctxt)
-#
-#         @ce_curlm curl_multi_setopt CURLMOPT_SOCKETDATA p_muctxt
-#         @ce_curlm curl_multi_setopt CURLMOPT_TIMERDATA p_muctxt
-#
-#
-#         @ce_curlm curl_multi_socket_action CURL_SOCKET_TIMEOUT 0 n_active
-#
-#         while (n_active[1] > 0) && (time_left > 0)
-#             evt_got = 0
-#             if (muctxt.chk_read || muctxt.chk_write)
-#                 t1 = int64(time() * 1000)
-#
-#                 poll_to = min(muctxt.timeout < 0.0 ? no_to : muctxt.timeout, time_left)
-#                 pfd_ret = poll_fd(RawFD(muctxt.s), poll_to, readable=muctxt.chk_read, writable=muctxt.chk_write)
-#
-#                 evt_got = (isreadable(pfd_ret) ? CURL_CSELECT_IN : 0) | (iswritable(pfd_ret) ? CURL_CSELECT_OUT : 0)
-#             else
-#                 break
-#             end
-#
-#             if (evt_got == 0)
-#                 @ce_curlm curl_multi_socket_action CURL_SOCKET_TIMEOUT 0 n_active
-#             else
-#                 @ce_curlm curl_multi_socket_action muctxt.s evt_got n_active
-#             end
-#
-#             time_left = request_timeout - (time() - started_at)
-#         end
-
-# END curl_multi_socket_action  mode
-
-# START curl_multi_perform  mode
-
         cmc = curl_multi_perform(curlm, n_active);
         while (n_active[1] > 0) &&  (time_left > 0)
             nb1 = ctxt.resp.bytes_recd
@@ -699,21 +741,16 @@ function exec_as_multi(ctxt)
             time_left = request_timeout - (time() - started_at)
         end
 
-# END OF curl_multi_perform
-
-
         if (n_active[1] == 0)
             msgs_in_queue = Array(Cint,1)
-            p_msg::Ptr{CURLMsg2} = curl_multi_info_read(curlm, msgs_in_queue)
+            p_msg::Ptr{CURLMsgResult} = curl_multi_info_read(curlm, msgs_in_queue)
 
             while (p_msg != C_NULL)
-#                println("Messages left in Q : " * string(msgs_in_queue[1]))
                 msg = unsafe_load(p_msg)
 
                 if (msg.msg == CURLMSG_DONE)
-                    ec = convert(Int, msg.data)
+                    ec = msg.result
                     if (ec != CURLE_OK)
-#                        println("Result of transfer: " * string(msg.data))
                         throw("Error executing request : " * bytestring(curl_easy_strerror(ec)))
                     else
                         process_response(ctxt)
@@ -734,6 +771,6 @@ function exec_as_multi(ctxt)
     ctxt.resp
 end
 
-
+println("If this prints, you're using the right version of HTTPClient.jl")
 
 end
