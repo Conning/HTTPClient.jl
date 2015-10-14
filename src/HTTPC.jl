@@ -620,9 +620,73 @@ urlencode(s::SubString) = urlencode(bytestring(s))
 export urlencode
 
 
+# close reusable curlm handles after a minute
+curlm_timer = Timer(0,0)
+const curlm_timeout = Dates.Millisecond(60000)
+const curlm_handles = Dict{Task,Ptr}()
+const curlm_timestamps = Dict{Task,DateTime}()
+const curlm_busy = Dict{Task,Bool}()
+
+function multi_time_remaining(timestamp)
+    elapsed = now() - timestamp
+    remaining = curlm_timeout - elapsed
+    return div(max(0, Dates.Millisecond(remaining).value), 1000)
+end
+
+function reset_multi_timer()
+    curlm_timer.isopen && close(curlm_timer)
+    if length(curlm_timestamps) > 0
+        remaining = multi_time_remaining(minimum(values(curlm_timestamps)))
+        global curlm_timer = Timer(curlm_cleanup, remaining, 0)
+    end
+end
+
+function curlm_cleanup(timer)
+    for (task, timestamp) in copy(curlm_timestamps)
+        if multi_time_remaining(timestamp) == 0
+            if curlm_busy[task]
+                curlm_timestamps[task] = now()
+            else
+                curlm = get(curlm_handles, task, nothing)
+                if curlm != nothing
+                    curl_multi_cleanup(curlm)
+                end
+                delete!(curlm_handles, task)
+                delete!(curlm_timestamps, task)
+                delete!(curlm_busy, task)
+            end
+        end
+    end
+    reset_multi_timer()
+end
+
+function get_my_multi_handle()
+    mytask = current_task()
+    curlm = get(curlm_handles, mytask, nothing)
+    if curlm == nothing
+        curlm = curl_multi_init()
+    end
+    if curlm != C_NULL
+        curlm_handles[mytask] = curlm
+        curlm_timestamps[mytask] = now()
+        curlm_busy[mytask] = true
+    end
+    reset_multi_timer()
+    return curlm
+end
+
+function unbusy_my_multi_handle()
+    mytask = current_task()
+    if in(mytask, keys(curlm_timestamps))
+        curlm_timestamps[mytask] = now()
+        curlm_busy[mytask] = false
+        reset_multi_timer()
+    end
+end
+
 function exec_as_multi(ctxt)
     curl = ctxt.curl
-    curlm = curl_multi_init()
+    curlm = get_my_multi_handle()
 
     if (curlm == C_NULL) error("Unable to initialize curl_multi_init()") end
 
@@ -728,7 +792,7 @@ function exec_as_multi(ctxt)
 
     finally
         curl_multi_remove_handle(curlm, curl)
-        curl_multi_cleanup(curlm)
+        unbusy_my_multi_handle()
     end
 
     ctxt.resp
